@@ -8,24 +8,17 @@ using HierarchicalMogSampler
 
 rng = MersenneTwister(20260406)
 
-sim = simulate_glam_style_data(
-    rng,
-    SimulationConfig(
-        n_subjects = 32,
-        n_features = 6,
-        min_repeats = 12,
-        max_repeats = 18,
-    );
-    active_indices = [1, 3],
-)
+x = Matrix{Float64}[]
+for _ in 1:8
+    component1 = -2 .+ 0.20 .* randn(rng, 4, 2)
+    component2 = 2 .+ 0.25 .* randn(rng, 5, 2)
+    push!(x, vcat(component1, component2))
+end
 
-cfg = SamplerConfig(
-    n_features(sim.data);
-    prior_means = sim.true_global_means,
-    canonicalize_labels = true,
-)
+data = HierarchicalMogData(x)
+cfg = SamplerConfig(n_features(data); prior_means = [-2.0 -2.0; 2.0 2.0])
 
-result = sample_posterior(rng, sim.data, cfg, 160; burnin = 80, thin = 20)
+result = sample_posterior(rng, data, cfg, 120; burnin = 60, thin = 20)
 
 println("saved draws: ", length(result.samples))
 println("last log posterior: ", round(result.final_sample.logposterior; digits = 2))

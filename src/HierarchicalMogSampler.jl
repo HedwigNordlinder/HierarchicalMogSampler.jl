@@ -10,12 +10,8 @@ export HierarchicalMogData,
        SamplerConfig,
        PosteriorSample,
        SamplerResult,
-       SimulationConfig,
-       GlamStyleSimulation,
        n_subjects,
        n_features,
-       glam_style_global_means,
-       simulate_glam_style_data,
        sample_posterior,
        logposterior,
        cluster1_fraction
@@ -32,23 +28,22 @@ least one row.
 """
 struct HierarchicalMogData
     x::Vector{Matrix{Float64}}
-end
-
-function HierarchicalMogData(x::Vector{<:AbstractMatrix{<:Real}})
-    isempty(x) && throw(ArgumentError("HierarchicalMogData requires at least one subject matrix."))
-    copied = Matrix{Float64}[]
-    p = nothing
-    for (i, Xi) in pairs(x)
-        size(Xi, 1) > 0 || throw(ArgumentError("Subject $i has no repeated observations."))
-        size(Xi, 2) > 0 || throw(ArgumentError("Subject $i has zero features."))
-        if p === nothing
-            p = size(Xi, 2)
-        elseif size(Xi, 2) != p
-            throw(ArgumentError("All subject matrices must have the same number of features."))
+    function HierarchicalMogData(x::Vector{<:AbstractMatrix{<:Real}})
+        isempty(x) && throw(ArgumentError("HierarchicalMogData requires at least one subject matrix."))
+        copied = Matrix{Float64}[]
+        p = nothing
+        for (i, Xi) in pairs(x)
+            size(Xi, 1) > 0 || throw(ArgumentError("Subject $i has no repeated observations."))
+            size(Xi, 2) > 0 || throw(ArgumentError("Subject $i has zero features."))
+            if p === nothing
+                p = size(Xi, 2)
+            elseif size(Xi, 2) != p
+                throw(ArgumentError("All subject matrices must have the same number of features."))
+            end
+            push!(copied, Matrix{Float64}(Xi))
         end
-        push!(copied, Matrix{Float64}(Xi))
+        return new(copied)
     end
-    return HierarchicalMogData(copied)
 end
 
 """
@@ -179,48 +174,6 @@ struct SamplerResult
     final_sample::PosteriorSample
 end
 
-"""
-    SimulationConfig(; n_subjects=96, n_features=6, min_repeats=14, max_repeats=22)
-
-Configuration for [`simulate_glam_style_data`](@ref).
-
-This reproduces the repeated-measurement part of the synthetic regime used in the original
-GLAM demo: subject-specific two-component mixtures with shared component covariances and
-subject-specific location and scale parameters. The downstream binary outcome model from
-the full GLAM demo is intentionally not included here because this package only covers the
-latent allocation stage.
-"""
-Base.@kwdef struct SimulationConfig
-    n_subjects::Int = 96
-    n_features::Int = 6
-    min_repeats::Int = 14
-    max_repeats::Int = 22
-end
-
-"""
-    GlamStyleSimulation
-
-Output from [`simulate_glam_style_data`](@ref).
-
-Fields:
-- `data`: observed repeated-measurement data ready for the sampler.
-- `true_z`: latent allocations with labels in `{1, 2}`.
-- `true_component2_prob`: subject-specific probability of component 2.
-- `true_mu`: array of shape `n_subjects x 2 x p` with subject-specific component means.
-- `true_lambda`: matrix of shape `n_subjects x 2` with subject-specific scale multipliers.
-- `true_global_means`: global component means used to simulate the subject-specific means.
-- `true_Sigma`: shared component covariance matrices used by the simulator.
-"""
-struct GlamStyleSimulation
-    data::HierarchicalMogData
-    true_z::Vector{Vector{Int}}
-    true_component2_prob::Vector{Float64}
-    true_mu::Array{Float64, 3}
-    true_lambda::Matrix{Float64}
-    true_global_means::Matrix{Float64}
-    true_Sigma::Vector{Matrix{Float64}}
-end
-
 mutable struct AllocationState
     z::Vector{Vector{Int}}
     component2_prob::Vector{Float64}
@@ -237,120 +190,6 @@ end
 end
 
 _copy_z(z::Vector{Vector{Int}}) = [copy(zi) for zi in z]
-
-"""
-    glam_style_global_means(p; active_indices=[1])
-
-Construct the `2 x p` global mean matrix used by the GLAM-style simulator.
-
-For active features, component 1 is set to `-1.5 - 0.15 * ell` and component 2 to
-`1.5 + 0.15 * ell`. For inactive features, odd indices receive no separation and even
-indices receive a small separation `(-0.15, 0.15)`. This exactly matches the feature-level
-mean construction used in the original GLAM demo's allocation generator.
-"""
-function glam_style_global_means(p::Integer; active_indices::Vector{Int} = [1])
-    p > 0 || throw(ArgumentError("The feature dimension p must be positive."))
-    active = falses(p)
-    for idx in active_indices
-        1 <= idx <= p || continue
-        active[idx] = true
-    end
-
-    means = zeros(2, p)
-    for ell in 1:p
-        if active[ell]
-            means[1, ell] = -1.5 - 0.15 * ell
-            means[2, ell] = 1.5 + 0.15 * ell
-        else
-            means[1, ell] = -0.15 * iseven(ell)
-            means[2, ell] = 0.15 * iseven(ell)
-        end
-    end
-    return means
-end
-
-"""
-    simulate_glam_style_data([rng], config=SimulationConfig(); active_indices=[1])
-
-Simulate repeated-measurement data from the same hierarchical two-component Gaussian
-mixture used by the original GLAM allocation demo.
-
-The simulator uses:
-- `component2_prob[i] ~ Beta(2.4, 2.0)`
-- `lambda[i, k] ~ Gamma(shape=5.0, scale=1/5.0)`
-- `mu[i, k] ~ Normal(true_global_means[k, :], true_Sigma[k] / (1.5 * lambda[i, k]))`
-- `x_ij | z_ij = k ~ Normal(mu[i, k], true_Sigma[k] / lambda[i, k])`
-
-Component labels are returned as `1` or `2`.
-"""
-function simulate_glam_style_data(
-    rng::AbstractRNG,
-    config::SimulationConfig = SimulationConfig();
-    active_indices::Vector{Int} = [1],
-)
-    config.n_subjects > 0 || throw(ArgumentError("n_subjects must be positive."))
-    config.n_features > 0 || throw(ArgumentError("n_features must be positive."))
-    config.min_repeats > 0 || throw(ArgumentError("min_repeats must be positive."))
-    config.max_repeats >= config.min_repeats ||
-        throw(ArgumentError("max_repeats must be at least min_repeats."))
-
-    n = config.n_subjects
-    p = config.n_features
-    global_means = glam_style_global_means(p; active_indices = active_indices)
-    Sigma_true = [
-        Matrix(Diagonal(fill(0.45, p))),
-        Matrix(Diagonal(fill(0.60, p))),
-    ]
-
-    x = Vector{Matrix{Float64}}(undef, n)
-    true_z = Vector{Vector{Int}}(undef, n)
-    true_component2_prob = Vector{Float64}(undef, n)
-    true_mu = zeros(n, 2, p)
-    true_lambda = zeros(n, 2)
-
-    for i in 1:n
-        n_i = rand(rng, config.min_repeats:config.max_repeats)
-        prob2 = rand(rng, Beta(2.4, 2.0))
-        true_component2_prob[i] = prob2
-
-        lambda_i = [rand(rng, Gamma(5.0, 1 / 5.0)) for _ in 1:2]
-        mu_i = [
-            rand(rng, MvNormal(global_means[k, :], Symmetric(Sigma_true[k] / (1.5 * lambda_i[k]))))
-            for k in 1:2
-        ]
-
-        for k in 1:2
-            true_lambda[i, k] = lambda_i[k]
-            @inbounds for ell in 1:p
-                true_mu[i, k, ell] = mu_i[k][ell]
-            end
-        end
-
-        zi = Vector{Int}(undef, n_i)
-        Xi = Matrix{Float64}(undef, n_i, p)
-        for j in 1:n_i
-            k = rand(rng) < prob2 ? 2 : 1
-            zi[j] = k
-            Xi[j, :] = rand(rng, MvNormal(mu_i[k], Symmetric(Sigma_true[k] / lambda_i[k])))
-        end
-
-        true_z[i] = zi
-        x[i] = Xi
-    end
-
-    return GlamStyleSimulation(
-        HierarchicalMogData(x),
-        true_z,
-        true_component2_prob,
-        true_mu,
-        true_lambda,
-        global_means,
-        Sigma_true,
-    )
-end
-
-simulate_glam_style_data(config::SimulationConfig = SimulationConfig(); kwargs...) =
-    simulate_glam_style_data(Random.default_rng(), config; kwargs...)
 
 function _initialize_state(rng::AbstractRNG, data::HierarchicalMogData, cfg::SamplerConfig)
     n = n_subjects(data)
